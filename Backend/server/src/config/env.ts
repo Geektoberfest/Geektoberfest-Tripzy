@@ -49,6 +49,12 @@ const envSchema = z
         // emitting text, and structured-output calls were observed exceeding 30s.
         GEMINI_TIMEOUT_MS: z.coerce.number().int().positive().default(90_000),
 
+        // NVIDIA fallback provider (optional). Used only when Gemini fails.
+        NVIDIA_API_KEY: z.string().trim().min(1).optional(),
+        NVIDIA_MODEL: z.string().trim().min(1).default("nvidia/nemotron-3.5-lightning-30b-a3b"),
+        NVIDIA_MODEL_FALLBACKS: z.string().trim().optional(),
+        NVIDIA_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+
         // OAuth configuration (Google & GitHub)
         GOOGLE_CLIENT_ID: z.string().trim().optional(),
         GOOGLE_CLIENT_SECRET: z.string().trim().optional(),

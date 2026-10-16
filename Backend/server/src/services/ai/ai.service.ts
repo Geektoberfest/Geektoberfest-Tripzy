@@ -10,6 +10,7 @@ import {
     type GeminiGenerateResponse,
     type GeminiRequestBody,
 } from "./gemini.provider.js";
+import { callNvidia, getNvidiaModels, isNvidiaConfigured } from "./nvidia.provider.js";
 import { KeyWaterfall, NoKeysConfiguredError } from "./keyWaterfall.js";
 
 export interface GenerateOptions {
@@ -28,7 +29,7 @@ export interface GenerateOptions {
 export interface GenerateResult<T = string> {
     output: T;
     model: string;
-    provider: "gemini";
+    provider: "gemini" | "nvidia";
     servedByKey: number;
     attempts: number;
     fallbackUsed: boolean;
@@ -111,14 +112,15 @@ function getGeminiWaterfall(): KeyWaterfall {
 }
 
 export function isAiConfigured(): boolean {
-    return env.GEMINI_API_KEYS.length > 0;
+    return env.GEMINI_API_KEYS.length > 0 || isNvidiaConfigured();
 }
 
 export function aiStatus(): Record<string, unknown> {
     return {
-        gemini: isAiConfigured()
+        gemini: env.GEMINI_API_KEYS.length > 0
             ? getGeminiWaterfall().status()
             : { label: "gemini", total: 0, ready: 0, gates: [] },
+        nvidia: { configured: isNvidiaConfigured() },
     };
 }
 
@@ -239,8 +241,55 @@ async function generateWithGemini(options: GenerateOptions, extraConfig?: Record
     }
 }
 
+async function generateWithNvidia(options: GenerateOptions, json: boolean): Promise<GenerateResult<string>> {
+    const timeoutMs = env.NVIDIA_TIMEOUT_MS;
+    let lastError: Error | null = null;
+    for (const [i, model] of getNvidiaModels().entries()) {
+        try {
+            const { text, usage } = await callNvidia({
+                model, json, timeoutMs,
+                prompt: options.prompt,
+                system: options.system,
+                temperature: options.temperature,
+                maxOutputTokens: options.maxOutputTokens,
+            });
+            console.log(`[AI] NVIDIA fallback SUCCESS | model=${model}`);
+            return {
+                output: text, model, provider: "nvidia", servedByKey: 0, attempts: i + 1,
+                fallbackUsed: i > 0, providerFallback: true,
+                usage: {
+                    promptTokens: usage?.prompt_tokens ?? null,
+                    outputTokens: usage?.completion_tokens ?? null,
+                    totalTokens: usage?.total_tokens ?? null,
+                },
+            };
+        } catch (error) {
+            lastError = error as Error;
+            console.warn(`[AI] NVIDIA FAIL | model=${model} | ${lastError.message}`);
+        }
+    }
+    throw Object.assign(lastError ?? new Error("NVIDIA fallback failed"), { statusCode: 503 });
+}
+
+/** Gemini first; NVIDIA (if configured) when Gemini is unconfigured, exhausted, or returns unusable output. */
+async function generateWithFallback<T>(
+    options: GenerateOptions,
+    json: boolean,
+    finish: (r: GenerateResult<string>) => T,
+): Promise<GenerateResult<T>> {
+    const run = async (r: GenerateResult<string>): Promise<GenerateResult<T>> => ({ ...r, output: finish(r) });
+    try {
+        if (env.GEMINI_API_KEYS.length === 0) throw new NoKeysConfiguredError("ai");
+        return await run(await generateWithGemini(options, json ? { responseMimeType: "application/json" } : undefined));
+    } catch (error) {
+        if (!isNvidiaConfigured() || (error as { statusCode?: number }).statusCode === 400) throw error;
+        console.warn(`[AI] Gemini failed (${(error as Error).message}); falling back to NVIDIA`);
+        return run(await generateWithNvidia(options, json));
+    }
+}
+
 export function generateText(options: GenerateOptions): Promise<GenerateResult<string>> {
-    return generateWithGemini(options);
+    return generateWithFallback(options, false, (r) => r.output);
 }
 
 function extractJsonValue(raw: string): unknown {
@@ -293,11 +342,11 @@ function extractJsonValue(raw: string): unknown {
 }
 
 export async function generateJson<T = unknown>(options: GenerateJsonOptions<T>): Promise<GenerateResult<T>> {
-    const result = await generateWithGemini(options, { responseMimeType: "application/json" });
-    console.log("[AI DEBUG] Raw output:", result.output.trim().slice(0, 400));
-    const parsed = extractJsonValue(result.output);
-    const output = options.validate ? options.validate(parsed) : (parsed as T);
-    return { ...result, output };
+    return generateWithFallback(options, true, (r) => {
+        console.log("[AI DEBUG] Raw output:", r.output.trim().slice(0, 400));
+        const parsed = extractJsonValue(r.output);
+        return options.validate ? options.validate(parsed) : (parsed as T);
+    });
 }
 
 export function resetAiWaterfall(): void {
