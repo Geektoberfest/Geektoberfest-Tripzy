@@ -35,6 +35,18 @@ if (process.env.NODE_ENV !== 'test') {
 
 export const db = drizzle(pool, { schema });
 
+// drizzle wraps driver failures in DrizzleQueryError ("Failed query: ...") and
+// keeps the real pg error (ENOTFOUND, auth, cert, timeout) on .cause.
+function describeError(error: unknown): string {
+    if (!(error instanceof Error)) return "Unknown database error";
+    const parts = [error.message];
+    for (let cause = error.cause; cause instanceof Error; cause = cause.cause) {
+        const code = (cause as { code?: string }).code;
+        parts.push(code ? `${code}: ${cause.message}` : cause.message);
+    }
+    return parts.join(" <- ");
+}
+
 export async function pingDatabase(): Promise<{ ok: boolean; latencyMs: number; error?: string }> {
     const start = Date.now();
     try {
@@ -44,7 +56,7 @@ export async function pingDatabase(): Promise<{ ok: boolean; latencyMs: number; 
         return {
             ok: false,
             latencyMs: Date.now() - start,
-            error: error instanceof Error ? error.message : "Unknown database error",
+            error: describeError(error),
         };
     }
 }
